@@ -20,6 +20,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    _ = dotenvy::dotenv();
     let bind = std::env::var("BIND").unwrap_or("0.0.0.0:3000".to_string());
     let bind = SocketAddr::from_str(&bind)?;
 
@@ -58,6 +59,7 @@ async fn unregister_old_task(state: &Arc<AppState>) -> Result<()> {
                 .iter()
                 .filter(|h| h.last_active.elapsed().as_millis() >= HANDLE_INACTIVE_TIMOUET)
             {
+                println!("[INFO] Unregister: {}", inactive_handle.full_name);
                 state.daemon.unregister(&inactive_handle.full_name)?;
             }
 
@@ -140,7 +142,13 @@ async fn register_mdns_inner(props: RegisterMdns, state: Arc<AppState>) -> Resul
             &props.host_name,
             ip,
             props.port,
-            props.properties.as_slice(),
+            props
+                .properties
+                .clone()
+                .into_iter()
+                .map(|p| (p.0, p.1.replace("{IF_IP}", &net_ip.to_string())))
+                .collect::<Vec<_>>()
+                .as_slice(),
         )?;
         let full_name = service.get_fullname().to_string();
 
@@ -158,5 +166,5 @@ async fn register_mdns_inner(props: RegisterMdns, state: Arc<AppState>) -> Resul
         state.daemon.register(service)?;
     }
 
-    todo!()
+    Ok(())
 }
