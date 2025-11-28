@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::{sync::RwLock, time::Instant};
 
 const HANDLE_INACTIVE_TIMOUET: u128 = 60000;
@@ -20,6 +20,9 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let bind = std::env::var("BIND").unwrap_or("0.0.0.0:3000".to_string());
+    let bind = SocketAddr::from_str(&bind)?;
+
     let state = Arc::new(AppState {
         handles: Arc::new(RwLock::new(Vec::new())),
         daemon: ServiceDaemon::new()?,
@@ -40,7 +43,8 @@ async fn main() -> Result<()> {
         .route("/", post(register_mdns))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    println!("[INFO] Starting listener on: {bind:?}");
+    let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 
     Ok(())
