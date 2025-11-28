@@ -1,12 +1,13 @@
-use std::sync::Arc;
-
 use anyhow::Result;
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
+use std::{sync::Arc, time::Duration};
 use tokio::{sync::RwLock, time::Instant};
 
-#[derive(Debug)]
+const HANDLE_INACTIVE_TIMOUET: u128 = 60000;
+
+#[derive(Debug, Clone)]
 pub struct MdnsServiceHandle {
     pub full_name: String,
     pub last_active: Instant,
@@ -24,6 +25,17 @@ async fn main() -> Result<()> {
         daemon: ServiceDaemon::new()?,
     });
 
+    let state_cloned = state.clone();
+    tokio::task::spawn(async move {
+        loop {
+            let res = unregister_old_task(&state_cloned).await;
+            if let Err(e) = res {
+                println!("[ERROR] Unregister old handles error: {e:?}");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    });
+
     let app = Router::new()
         .route("/", post(register_mdns))
         .with_state(state);
@@ -32,6 +44,28 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await.unwrap();
 
     Ok(())
+}
+
+async fn unregister_old_task(state: &Arc<AppState>) -> Result<()> {
+    loop {
+        {
+            let mut handles = state.handles.write().await;
+            for inactive_handle in handles
+                .iter()
+                .filter(|h| h.last_active.elapsed().as_millis() >= HANDLE_INACTIVE_TIMOUET)
+            {
+                state.daemon.unregister(&inactive_handle.full_name)?;
+            }
+
+            *handles = handles
+                .clone()
+                .into_iter()
+                .filter(|h| h.last_active.elapsed().as_millis() < HANDLE_INACTIVE_TIMOUET)
+                .collect();
+        }
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
