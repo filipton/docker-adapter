@@ -1,5 +1,10 @@
 use anyhow::Result;
-use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+use axum::{
+    Json, Router,
+    extract::State,
+    response::IntoResponse,
+    routing::{get, post},
+};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
@@ -42,6 +47,7 @@ async fn main() -> Result<()> {
     });
 
     let app = Router::new()
+        .route("/", get(health_check))
         .route("/", post(register_mdns))
         .with_state(state);
 
@@ -50,6 +56,10 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await.unwrap();
 
     Ok(())
+}
+
+async fn health_check() -> impl IntoResponse {
+    "OK"
 }
 
 async fn unregister_old_task(state: &Arc<AppState>) -> Result<()> {
