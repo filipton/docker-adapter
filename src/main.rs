@@ -6,6 +6,7 @@ use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::{sync::RwLock, time::Instant};
 
 const HANDLE_INACTIVE_TIMOUET: u128 = 60000;
+const DEFAULT_BIND: &str = "0.0.0.0:3127";
 
 #[derive(Debug, Clone)]
 pub struct MdnsServiceHandle {
@@ -21,7 +22,7 @@ struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     _ = dotenvy::dotenv();
-    let bind = std::env::var("BIND").unwrap_or("0.0.0.0:3000".to_string());
+    let bind = std::env::var("BIND").unwrap_or(DEFAULT_BIND.to_string());
     let bind = SocketAddr::from_str(&bind)?;
 
     let state = Arc::new(AppState {
