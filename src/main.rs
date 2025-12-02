@@ -168,6 +168,7 @@ async fn register_mdns_inner(props: RegisterMdns, state: Arc<AppState>) -> Resul
         if let Some(found) = found {
             found.last_active = Instant::now();
         } else {
+            println!("[INFO] Register: {}", full_name);
             handles.push(MdnsServiceHandle {
                 full_name,
                 last_active: Instant::now(),
