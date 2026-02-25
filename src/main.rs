@@ -13,7 +13,10 @@ use btleplug::{
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
-use tokio::{sync::RwLock, time::Instant};
+use tokio::{
+    sync::RwLock,
+    time::{Instant, timeout},
+};
 use uuid::Uuid;
 
 const HANDLE_INACTIVE_TIMOUET: u128 = 60000;
@@ -261,7 +264,12 @@ async fn ble_write(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<BleWrite>,
 ) -> impl IntoResponse {
-    match ble_write_inner(payload, state).await {
+    match timeout(
+        Duration::from_millis(30000),
+        ble_write_inner(payload, state),
+    )
+    .await
+    {
         Ok(_) => (StatusCode::OK, "OK".to_string()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("ERROR {e:?}")).into_response(),
     }
