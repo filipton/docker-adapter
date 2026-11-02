@@ -8,7 +8,7 @@ use axum::{
 };
 use btleplug::{
     api::{Central as _, Manager as _, Peripheral as _},
-    platform::{Adapter, Manager},
+    platform::{Adapter, Manager, Peripheral},
 };
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,9 @@ use uuid::Uuid;
 
 const HANDLE_INACTIVE_TIMOUET: u128 = 60000;
 const DEFAULT_BIND: &str = "0.0.0.0:3127";
+// Together they keep the 30s limit a client sees, disconnect included.
+const BLE_WRITE_TIMEOUT: Duration = Duration::from_secs(25);
+const BLE_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct MdnsServiceHandle {
@@ -31,7 +34,7 @@ pub struct MdnsServiceHandle {
 struct AppState {
     pub mdns_handles: Arc<RwLock<Vec<MdnsServiceHandle>>>,
     pub mdns_daemon: ServiceDaemon,
-    pub ble_last_scan_devices: Arc<RwLock<Vec<btleplug::platform::Peripheral>>>,
+    pub ble_last_scan_devices: Arc<RwLock<Vec<Peripheral>>>,
     pub ble_adapter: Option<Adapter>,
 }
 
@@ -264,26 +267,46 @@ async fn ble_write(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<BleWrite>,
 ) -> impl IntoResponse {
-    match timeout(
-        Duration::from_millis(30000),
-        ble_write_inner(payload, state),
-    )
-    .await
-    {
-        Ok(_) => (StatusCode::OK, "OK".to_string()).into_response(),
+    // Spawned, so a client hanging up can't drop the write before it disconnects.
+    match tokio::spawn(ble_write_inner(payload, state)).await {
+        Ok(Ok(_)) => (StatusCode::OK, "OK".to_string()).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("ERROR {e:?}")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("ERROR {e:?}")).into_response(),
     }
 }
 
 async fn ble_write_inner(data: BleWrite, state: Arc<AppState>) -> Result<()> {
-    let scan_devices = state.ble_last_scan_devices.read().await;
-    let Some(device) = scan_devices
+    let device = state
+        .ble_last_scan_devices
+        .read()
+        .await
         .iter()
         .find(|x| x.id().to_string() == data.device_id)
-    else {
-        return Err(anyhow!("Device not found!"));
-    };
+        .cloned()
+        .ok_or_else(|| anyhow!("Device not found!"))?;
 
+    write_then_disconnect(ble_write_device(&device, &data), device.disconnect()).await
+}
+
+// The disconnect runs outside of the write timeout, because a dropped write never reaches it and
+// the device stays connected. It also cancels a `connect()` that is still pending. It has its own
+// timeout, because on macOS btleplug never answers for a peripheral it has already forgotten.
+async fn write_then_disconnect(
+    write: impl Future<Output = Result<()>>,
+    disconnect: impl Future<Output = btleplug::Result<()>>,
+) -> Result<()> {
+    let res = timeout(BLE_WRITE_TIMEOUT, write).await;
+
+    match timeout(BLE_DISCONNECT_TIMEOUT, disconnect).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => println!("[ERROR] Ble disconnect error: {e:?}"),
+        Err(_) => println!("[ERROR] Ble disconnect timed out!"),
+    }
+
+    res?
+}
+
+async fn ble_write_device(device: &Peripheral, data: &BleWrite) -> Result<()> {
     if !device.is_connected().await? {
         device.connect().await?;
     }
@@ -296,10 +319,74 @@ async fn ble_write_inner(data: BleWrite, state: Arc<AppState>) -> Result<()> {
         .find(|c| c.uuid == data.characteristic)
         .ok_or_else(|| anyhow::anyhow!("Couldn't find characteristic!"))?;
 
-    _ = device
+    device
         .write(c, &data.data, btleplug::api::WriteType::WithoutResponse)
+        .await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnects_after_successful_write() {
+        let disconnected = AtomicBool::new(false);
+        let res = write_then_disconnect(async { Ok(()) }, async {
+            disconnected.store(true, Ordering::SeqCst);
+            Ok(())
+        })
         .await;
 
-    _ = device.disconnect().await;
-    Ok(())
+        assert!(res.is_ok());
+        assert!(disconnected.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnects_after_failed_write() {
+        let disconnected = AtomicBool::new(false);
+        let res = write_then_disconnect(async { Err(anyhow!("write failed")) }, async {
+            disconnected.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert_eq!(res.unwrap_err().to_string(), "write failed");
+        assert!(disconnected.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnects_after_write_timeout() {
+        let start = Instant::now();
+        let disconnected = AtomicBool::new(false);
+        let res = write_then_disconnect(std::future::pending(), async {
+            assert_eq!(start.elapsed(), BLE_WRITE_TIMEOUT);
+            disconnected.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(res.is_err());
+        assert!(disconnected.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_disconnect_is_bounded_and_keeps_write_result() {
+        let start = Instant::now();
+        let res = write_then_disconnect(async { Ok(()) }, std::future::pending()).await;
+
+        assert!(res.is_ok());
+        assert_eq!(start.elapsed(), BLE_DISCONNECT_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_and_disconnect_stay_within_30_seconds() {
+        let start = Instant::now();
+        let res = write_then_disconnect(std::future::pending(), std::future::pending()).await;
+
+        assert!(res.is_err());
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+    }
 }
